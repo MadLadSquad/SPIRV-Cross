@@ -1167,6 +1167,7 @@ void CompilerHLSL::emit_composite_constants()
 
 		if (type.basetype == SPIRType::Struct || !type.array.empty())
 		{
+			add_resource_name(c.self);
 			auto name = to_name(c.self);
 			statement("static const ", variable_decl(type, name), " = ", constant_expression(c), ";");
 			emitted = true;
@@ -1213,16 +1214,23 @@ void CompilerHLSL::emit_specialization_constants_and_structs()
 			else if (c.specialization)
 			{
 				auto &type = get<SPIRType>(c.constant_type);
+				add_resource_name(c.self);
 				auto name = to_name(c.self);
 
-				// HLSL does not support specialization constants, so fallback to macros.
-				c.specialization_constant_macro_name =
-				    constant_value_macro_name(get_decoration(c.self, DecorationSpecId));
+				if (has_decoration(c.self, DecorationSpecId))
+				{
+					// HLSL does not support specialization constants, so fallback to macros.
+					c.specialization_constant_macro_name =
+							constant_value_macro_name(get_decoration(c.self, DecorationSpecId));
 
-				statement("#ifndef ", c.specialization_constant_macro_name);
-				statement("#define ", c.specialization_constant_macro_name, " ", constant_expression(c));
-				statement("#endif");
-				statement("static const ", variable_decl(type, name), " = ", c.specialization_constant_macro_name, ";");
+					statement("#ifndef ", c.specialization_constant_macro_name);
+					statement("#define ", c.specialization_constant_macro_name, " ", constant_expression(c));
+					statement("#endif");
+					statement("static const ", variable_decl(type, name), " = ", c.specialization_constant_macro_name, ";");
+				}
+				else
+					statement("static const ", variable_decl(type, name), " = ", constant_expression(c), ";");
+
 				emitted = true;
 			}
 		}
@@ -1230,6 +1238,7 @@ void CompilerHLSL::emit_specialization_constants_and_structs()
 		{
 			auto &c = id.get<SPIRConstantOp>();
 			auto &type = get<SPIRType>(c.basetype);
+			add_resource_name(c.self);
 			auto name = to_name(c.self);
 			statement("static const ", variable_decl(type, name), " = ", constant_op_expression(c), ";");
 			emitted = true;
@@ -1326,7 +1335,8 @@ void CompilerHLSL::emit_resources()
 		}
 	});
 
-	if (execution.model == ExecutionModelVertex && hlsl_options.shader_model <= 30)
+	if (execution.model == ExecutionModelVertex && hlsl_options.shader_model <= 30 &&
+	    active_output_builtins.get(BuiltInPosition))
 	{
 		statement("uniform float4 gl_HalfPixel;");
 		emitted = true;
@@ -2093,7 +2103,11 @@ void CompilerHLSL::emit_buffer_block(const SPIRVariable &var)
 
 	bool is_uav = var.storage == StorageClassStorageBuffer || has_decoration(type.self, DecorationBufferBlock);
 
-	if (is_uav)
+	if (flattened_buffer_blocks.count(var.self))
+	{
+		emit_buffer_block_flattened(var);
+	}
+	else if (is_uav)
 	{
 		Bitset flags = ir.get_buffer_block_flags(var);
 		bool is_readonly = flags.get(DecorationNonWritable) && !is_hlsl_force_storage_buffer_as_uav(var.self);
@@ -2198,7 +2212,11 @@ void CompilerHLSL::emit_buffer_block(const SPIRVariable &var)
 
 void CompilerHLSL::emit_push_constant_block(const SPIRVariable &var)
 {
-	if (root_constants_layout.empty())
+	if (flattened_buffer_blocks.count(var.self))
+	{
+		emit_buffer_block_flattened(var);
+	}
+	else if (root_constants_layout.empty())
 	{
 		emit_buffer_block(var);
 	}
@@ -2356,7 +2374,7 @@ void CompilerHLSL::emit_function_prototype(SPIRFunction &func, const Bitset &ret
 		out_argument += " ";
 		out_argument += "spvReturnValue";
 		out_argument += type_to_array_glsl(type);
-		arglist.push_back(move(out_argument));
+		arglist.push_back(std::move(out_argument));
 	}
 
 	for (auto &arg : func.arguments)
@@ -2380,7 +2398,7 @@ void CompilerHLSL::emit_function_prototype(SPIRFunction &func, const Bitset &ret
 		    arg_type.image.dim != DimBuffer)
 		{
 			// Manufacture automatic sampler arg for SampledImage texture
-			arglist.push_back(join(image_is_comparison(arg_type, arg.id) ? "SamplerComparisonState " : "SamplerState ",
+			arglist.push_back(join(is_depth_image(arg_type, arg.id) ? "SamplerComparisonState " : "SamplerState ",
 			                       to_sampler_expression(arg.id), type_to_array_glsl(arg_type)));
 		}
 
@@ -2430,6 +2448,16 @@ void CompilerHLSL::emit_hlsl_entry_point()
 		uint32_t x = execution.workgroup_size.x;
 		uint32_t y = execution.workgroup_size.y;
 		uint32_t z = execution.workgroup_size.z;
+
+		if (!execution.workgroup_size.constant && execution.flags.get(ExecutionModeLocalSizeId))
+		{
+			if (execution.workgroup_size.id_x)
+				x = get<SPIRConstant>(execution.workgroup_size.id_x).scalar();
+			if (execution.workgroup_size.id_y)
+				y = get<SPIRConstant>(execution.workgroup_size.id_y).scalar();
+			if (execution.workgroup_size.id_z)
+				z = get<SPIRConstant>(execution.workgroup_size.id_z).scalar();
+		}
 
 		auto x_expr = wg_x.id ? get<SPIRConstant>(wg_x.id).specialization_constant_macro_name : to_string(x);
 		auto y_expr = wg_y.id ? get<SPIRConstant>(wg_y.id).specialization_constant_macro_name : to_string(y);
@@ -2712,7 +2740,7 @@ void CompilerHLSL::emit_hlsl_entry_point()
 
 void CompilerHLSL::emit_fixup()
 {
-	if (is_vertex_like_shader())
+	if (is_vertex_like_shader() && active_output_builtins.get(BuiltInPosition))
 	{
 		// Do various mangling on the gl_Position.
 		if (hlsl_options.shader_model <= 30)
@@ -2910,7 +2938,7 @@ void CompilerHLSL::emit_texture_op(const Instruction &i, bool sparse)
 		{
 			texop += img_expr;
 
-			if (image_is_comparison(imgtype, img))
+			if (is_depth_image(imgtype, img))
 			{
 				if (gather)
 				{
@@ -3386,7 +3414,7 @@ void CompilerHLSL::emit_modern_uniform(const SPIRVariable &var)
 		if (type.basetype == SPIRType::SampledImage && type.image.dim != DimBuffer)
 		{
 			// For combined image samplers, also emit a combined image sampler.
-			if (image_is_comparison(type, var.self))
+			if (is_depth_image(type, var.self))
 				statement("SamplerComparisonState ", to_sampler_expression(var.self), type_to_array_glsl(type),
 				          to_resource_binding_sampler(var), ";");
 			else
@@ -3968,7 +3996,7 @@ void CompilerHLSL::read_access_chain(string *expr, const string &lhs, const SPIR
 	if (lhs.empty())
 	{
 		assert(expr);
-		*expr = move(load_expr);
+		*expr = std::move(load_expr);
 	}
 	else
 		statement(lhs, " = ", load_expr, ";");
@@ -5645,7 +5673,7 @@ void CompilerHLSL::require_texture_query_variant(uint32_t var_id)
 
 void CompilerHLSL::set_root_constant_layouts(std::vector<RootConstants> layout)
 {
-	root_constants_layout = move(layout);
+	root_constants_layout = std::move(layout);
 }
 
 void CompilerHLSL::add_vertex_attribute_remap(const HLSLVertexAttributeRemap &vertex_attributes)
@@ -5696,6 +5724,7 @@ VariableID CompilerHLSL::remap_num_workgroups_builtin()
 	ir.meta[variable_id].decoration.alias = "SPIRV_Cross_NumWorkgroups";
 
 	num_workgroups_builtin = variable_id;
+	get_entry_point().interface_variables.push_back(num_workgroups_builtin);
 	return variable_id;
 }
 
@@ -5784,10 +5813,7 @@ string CompilerHLSL::compile()
 	uint32_t pass_count = 0;
 	do
 	{
-		if (pass_count >= 3)
-			SPIRV_CROSS_THROW("Over 3 compilation loops detected. Must be a bug!");
-
-		reset();
+		reset(pass_count);
 
 		// Move constructor for this type is broken on GCC 4.9 ...
 		buffer.reset();
