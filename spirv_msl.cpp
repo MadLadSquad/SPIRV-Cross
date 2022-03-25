@@ -1371,6 +1371,7 @@ string CompilerMSL::compile()
 	for (auto &id : next_metal_resource_ids)
 		id = 0;
 
+	fixup_anonymous_struct_names();
 	fixup_type_alias();
 	replace_illegal_names();
 	sync_entry_point_aliases_and_names();
@@ -1548,6 +1549,14 @@ void CompilerMSL::extract_global_variables_from_functions()
 	// Uniforms
 	unordered_set<uint32_t> global_var_ids;
 	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+		// Some builtins resolve directly to a function call which does not need any declared variables.
+		// Skip these.
+		if (var.storage == StorageClassInput && has_decoration(var.self, DecorationBuiltIn) &&
+		    BuiltIn(get_decoration(var.self, DecorationBuiltIn)) == BuiltInHelperInvocation)
+		{
+			return;
+		}
+
 		if (var.storage == StorageClassInput || var.storage == StorageClassOutput ||
 		    var.storage == StorageClassUniform || var.storage == StorageClassUniformConstant ||
 		    var.storage == StorageClassPushConstant || var.storage == StorageClassStorageBuffer)
@@ -3124,6 +3133,14 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 		return;
 	}
 
+	// If variable names alias, they will end up with wrong names in the interface struct, because
+	// there might be aliases in the member name cache and there would be a mismatch in fixup_in code.
+	// Make sure to register the variables as unique resource names ahead of time.
+	// This would normally conflict with the name cache when emitting local variables,
+	// but this happens in the setup stage, before we hit compilation loops.
+	// The name cache is cleared before we actually emit code, so this is safe.
+	add_resource_name(var.self);
+
 	if (var_type.basetype == SPIRType::Struct)
 	{
 		bool block_requires_flattening = variable_storage_requires_stage_io(storage) || is_block;
@@ -3181,7 +3198,7 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 
 					if (storage == StorageClassOutput && is_stage_output_block_member_masked(var, mbr_idx, meta.strip_array))
 					{
-						location = UINT32_MAX;		// Skip this member and resolve location again on next var member
+						location = UINT32_MAX; // Skip this member and resolve location again on next var member
 
 						if (is_block)
 							masked_block = true;
@@ -3218,16 +3235,18 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 					{
 						bool is_composite_type = is_matrix(mbr_type) || is_array(mbr_type) || mbr_type.basetype == SPIRType::Struct;
 						bool attribute_load_store =
-						storage == StorageClassInput && get_execution_model() != ExecutionModelFragment;
+								storage == StorageClassInput && get_execution_model() != ExecutionModelFragment;
 						bool storage_is_stage_io = variable_storage_requires_stage_io(storage);
 
 						// Clip/CullDistance always need to be declared as user attributes.
 						if (builtin == BuiltInClipDistance || builtin == BuiltInCullDistance)
 							is_builtin = false;
 
-						string mbr_name_qual = to_name(var_type.self);
-						string var_chain_qual = to_name(var.self);
-						if (elem_cnt > 1) {
+						const string var_name = to_name(var.self);
+						string mbr_name_qual = var_name;
+						string var_chain_qual = var_name;
+						if (elem_cnt > 1)
+						{
 							mbr_name_qual += join("_", elem_idx);
 							var_chain_qual += join("[", elem_idx, "]");
 						}
@@ -4932,7 +4951,7 @@ void CompilerMSL::emit_custom_functions()
 
 			for (uint32_t variant = 0; variant < 12; variant++)
 			{
-				uint32_t dimensions = spv_func - SPVFuncImplArrayCopyMultidimBase;
+				uint8_t dimensions = spv_func - SPVFuncImplArrayCopyMultidimBase;
 				string tmp = "template<typename T";
 				for (uint8_t i = 0; i < dimensions; i++)
 				{
@@ -7632,6 +7651,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	auto ops = stream(instruction);
 	auto opcode = static_cast<Op>(instruction.op);
 
+	opcode = get_remapped_spirv_op(opcode);
+
 	// If we need to do implicit bitcasts, make sure we do it with the correct type.
 	uint32_t integer_width = get_integer_width_for_instruction(instruction);
 	auto int_type = to_signed_basetype(integer_width);
@@ -7674,6 +7695,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	case OpLogicalNotEqual:
 	case OpFOrdNotEqual:
+		// TODO: Should probably negate the == result here.
+		// Typically OrdNotEqual comes from GLSL which itself does not really specify what
+		// happens with NaN.
+		// Consider fixing this if we run into real issues.
 		MSL_BOP(!=);
 		break;
 
@@ -7730,7 +7755,9 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFUnordNotEqual:
-		MSL_UNORD_BOP(!=);
+		// not equal in MSL generates une opcodes to begin with.
+		// Since unordered not equal is how it works in C, just inherit that behavior.
+		MSL_BOP(!=);
 		break;
 
 	case OpFUnordGreaterThan:
@@ -8505,8 +8532,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 #define MSL_RAY_QUERY_IS_OP2(op, msl_op) MSL_RAY_QUERY_OP_INNER2(op, .is, msl_op)
 
 		MSL_RAY_QUERY_GET_OP(RayTMin, ray_min_distance);
-		MSL_RAY_QUERY_GET_OP(WorldRayOrigin, world_space_ray_direction);
-		MSL_RAY_QUERY_GET_OP(WorldRayDirection, world_space_ray_origin);
+		MSL_RAY_QUERY_GET_OP(WorldRayOrigin, world_space_ray_origin);
+		MSL_RAY_QUERY_GET_OP(WorldRayDirection, world_space_ray_direction);
 		MSL_RAY_QUERY_GET_OP2(IntersectionInstanceId, instance_id);
 		MSL_RAY_QUERY_GET_OP2(IntersectionInstanceCustomIndex, user_instance_id);
 		MSL_RAY_QUERY_GET_OP2(IntersectionBarycentrics, triangle_barycentric_coord);
@@ -8992,6 +9019,8 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 	uint32_t integer_width = get_integer_width_for_glsl_instruction(op, args, count);
 	auto int_type = to_signed_basetype(integer_width);
 	auto uint_type = to_unsigned_basetype(integer_width);
+
+	op = get_remapped_glsl_op(op);
 
 	switch (op)
 	{
@@ -12153,16 +12182,6 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 					});
 				}
 				break;
-			case BuiltInHelperInvocation:
-				if (msl_options.is_ios() && !msl_options.supports_msl_version(2, 3))
-					SPIRV_CROSS_THROW("simd_is_helper_thread() requires version 2.3 on iOS.");
-				else if (msl_options.is_macos() && !msl_options.supports_msl_version(2, 1))
-					SPIRV_CROSS_THROW("simd_is_helper_thread() requires version 2.1 on macOS.");
-
-				entry_func.fixup_hooks_in.push_back([=]() {
-					statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = simd_is_helper_thread();");
-				});
-				break;
 			case BuiltInInvocationId:
 				// This is direct-mapped without multi-patch workgroups.
 				if (get_execution_model() != ExecutionModelTessellationControl || !msl_options.multi_patch_workgroup)
@@ -13584,14 +13603,14 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id)
 		break;
 	case SPIRType::AccelerationStructure:
 		if (msl_options.supports_msl_version(2, 4))
-			type_name = "acceleration_structure<instancing>";
+			type_name = "raytracing::acceleration_structure<raytracing::instancing>";
 		else if (msl_options.supports_msl_version(2, 3))
-			type_name = "instance_acceleration_structure";
+			type_name = "raytracing::instance_acceleration_structure";
 		else
 			SPIRV_CROSS_THROW("Acceleration Structure Type is supported in MSL 2.3 and above.");
 		break;
 	case SPIRType::RayQuery:
-		return "intersection_query<instancing, triangle_data>";
+		return "raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data>";
 
 	default:
 		return "unknown_type";
@@ -14456,6 +14475,14 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
 			            "].insideTessellationFactor");
 		}
 		break;
+
+	case BuiltInHelperInvocation:
+		if (msl_options.is_ios() && !msl_options.supports_msl_version(2, 3))
+			SPIRV_CROSS_THROW("simd_is_helper_thread() requires version 2.3 on iOS.");
+		else if (msl_options.is_macos() && !msl_options.supports_msl_version(2, 1))
+			SPIRV_CROSS_THROW("simd_is_helper_thread() requires version 2.1 on macOS.");
+		// In SPIR-V 1.6 with Volatile HelperInvocation, we cannot emit a fixup early.
+		return "simd_is_helper_thread()";
 
 	default:
 		break;

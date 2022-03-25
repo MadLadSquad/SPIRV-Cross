@@ -656,6 +656,7 @@ string CompilerGLSL::compile()
 		backend.support_case_fallthrough = false;
 
 	// Scan the SPIR-V to find trivial uses of extensions.
+	fixup_anonymous_struct_names();
 	fixup_type_alias();
 	reorder_type_alias();
 	build_function_control_flow_graphs_and_analyze();
@@ -4989,14 +4990,13 @@ string CompilerGLSL::constant_expression(const SPIRConstant &c, bool inside_bloc
 		// Handles Arrays and structures.
 		string res;
 
-		// Only consider the decay if we are inside a struct scope.
-		// Outside a struct declaration, we can always bind to a constant array with templated type.
+		// Only consider the decay if we are inside a struct scope where we are emitting a member with Offset decoration.
+		// Outside a block-like struct declaration, we can always bind to a constant array with templated type.
+		// Should look at ArrayStride here as well, but it's possible to declare a constant struct
+		// with Offset = 0, using no ArrayStride on the enclosed array type.
+		// A particular CTS test hits this scenario.
 		bool array_type_decays = inside_block_like_struct_scope &&
-		                         !type.array.empty() && !backend.array_is_value_type_in_buffer_blocks &&
-		                         has_decoration(c.constant_type, DecorationArrayStride);
-
-		if (type.array.empty() && type.basetype == SPIRType::Struct && type_is_block_like(type))
-			inside_block_like_struct_scope = true;
+		                         !type.array.empty() && !backend.array_is_value_type_in_buffer_blocks;
 
 		// Allow Metal to use the array<T> template to make arrays a value type
 		bool needs_trailing_tracket = false;
@@ -5020,16 +5020,29 @@ string CompilerGLSL::constant_expression(const SPIRConstant &c, bool inside_bloc
 			res = type_to_glsl_constructor(type) + "(";
 		}
 
+		uint32_t subconstant_index = 0;
 		for (auto &elem : c.subconstants)
 		{
 			auto &subc = get<SPIRConstant>(elem);
 			if (subc.specialization)
 				res += to_name(elem);
 			else
+			{
+				if (type.array.empty() && type.basetype == SPIRType::Struct)
+				{
+					// When we get down to emitting struct members, override the block-like information.
+					// For constants, we can freely mix and match block-like state.
+					inside_block_like_struct_scope =
+							has_member_decoration(type.self, subconstant_index, DecorationOffset);
+				}
+
 				res += constant_expression(subc, inside_block_like_struct_scope);
+			}
 
 			if (&elem != &c.subconstants.back())
 				res += ", ";
+
+			subconstant_index++;
 		}
 
 		res += backend.use_initializer_list ? " }" : ")";
@@ -7307,6 +7320,63 @@ string CompilerGLSL::to_function_args(const TextureFunctionArguments &args, bool
 	return farg_str;
 }
 
+Op CompilerGLSL::get_remapped_spirv_op(Op op) const
+{
+	if (options.relax_nan_checks)
+	{
+		switch (op)
+		{
+		case OpFUnordLessThan:
+			op = OpFOrdLessThan;
+			break;
+		case OpFUnordLessThanEqual:
+			op = OpFOrdLessThanEqual;
+			break;
+		case OpFUnordGreaterThan:
+			op = OpFOrdGreaterThan;
+			break;
+		case OpFUnordGreaterThanEqual:
+			op = OpFOrdGreaterThanEqual;
+			break;
+		case OpFUnordEqual:
+			op = OpFOrdEqual;
+			break;
+		case OpFOrdNotEqual:
+			op = OpFUnordNotEqual;
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	return op;
+}
+
+GLSLstd450 CompilerGLSL::get_remapped_glsl_op(GLSLstd450 std450_op) const
+{
+	// Relax to non-NaN aware opcodes.
+	if (options.relax_nan_checks)
+	{
+		switch (std450_op)
+		{
+		case GLSLstd450NClamp:
+			std450_op = GLSLstd450FClamp;
+			break;
+		case GLSLstd450NMin:
+			std450_op = GLSLstd450FMin;
+			break;
+		case GLSLstd450NMax:
+			std450_op = GLSLstd450FMax;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return std450_op;
+}
+
 void CompilerGLSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, const uint32_t *args, uint32_t length)
 {
 	auto op = static_cast<GLSLstd450>(eop);
@@ -7318,6 +7388,8 @@ void CompilerGLSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
 	uint32_t integer_width = get_integer_width_for_glsl_instruction(op, args, length);
 	auto int_type = to_signed_basetype(integer_width);
 	auto uint_type = to_unsigned_basetype(integer_width);
+
+	op = get_remapped_glsl_op(op);
 
 	switch (op)
 	{
@@ -9526,8 +9598,11 @@ bool CompilerGLSL::should_forward(uint32_t id) const
 	// This is important because otherwise we'll get local sampler copies (highp sampler2D foo = bar) that are invalid in OpenGL GLSL
 
 	auto *var = maybe_get<SPIRVariable>(id);
-	if (var && var->forwardable)
-		return true;
+	if (var)
+	{
+		// Never forward volatile builtin variables, e.g. SPIR-V 1.6 HelperInvocation.
+		return !(has_decoration(id, DecorationBuiltIn) && has_decoration(id, DecorationVolatile));
+	}
 
 	// For debugging emit temporary variables for all expressions
 	if (options.force_temporary)
@@ -9539,6 +9614,14 @@ bool CompilerGLSL::should_forward(uint32_t id) const
 	const uint32_t max_expression_dependencies = 64;
 	if (expr && expr->expression_dependencies.size() >= max_expression_dependencies)
 		return false;
+
+	if (expr && expr->loaded_from
+		&& has_decoration(expr->loaded_from, DecorationBuiltIn)
+		&& has_decoration(expr->loaded_from, DecorationVolatile))
+	{
+		// Never forward volatile builtin variables, e.g. SPIR-V 1.6 HelperInvocation.
+		return false;
+	}
 
 	// Immutable expression can always be forwarded.
 	if (is_immutable(id))
@@ -10093,6 +10176,8 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 	uint32_t integer_width = get_integer_width_for_instruction(instruction);
 	auto int_type = to_signed_basetype(integer_width);
 	auto uint_type = to_unsigned_basetype(integer_width);
+
+	opcode = get_remapped_spirv_op(opcode);
 
 	switch (opcode)
 	{
@@ -11220,7 +11305,11 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 
 	case OpLogicalNotEqual:
 	case OpFOrdNotEqual:
+	case OpFUnordNotEqual:
 	{
+		// GLSL is fuzzy on what to do with ordered vs unordered not equal.
+		// glslang started emitting UnorderedNotEqual some time ago to harmonize with IEEE,
+		// but this means we have no easy way of implementing ordered not equal.
 		if (expression_type(ops[2]).vecsize > 1)
 			GLSL_BFOP(notEqual);
 		else
@@ -12024,7 +12113,7 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 			pure = false;
 		}
 
-		if (var && var->forwardable)
+		if (var)
 		{
 			bool forward = forced_temporaries.find(id) == end(forced_temporaries);
 			auto &e = emit_op(result_type, id, imgexpr, forward);
@@ -12540,7 +12629,6 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFUnordEqual:
-	case OpFUnordNotEqual:
 	case OpFUnordLessThan:
 	case OpFUnordGreaterThan:
 	case OpFUnordLessThanEqual:
@@ -12561,10 +12649,6 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 			{
 			case OpFUnordEqual:
 				comp_op = "notEqual";
-				break;
-
-			case OpFUnordNotEqual:
-				comp_op = "equal";
 				break;
 
 			case OpFUnordLessThan:
@@ -12597,10 +12681,6 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 			{
 			case OpFUnordEqual:
 				comp_op = " != ";
-				break;
-
-			case OpFUnordNotEqual:
-				comp_op = " == ";
 				break;
 
 			case OpFUnordLessThan:
@@ -12794,6 +12874,8 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		if (!options.vulkan_semantics)
 			SPIRV_CROSS_THROW("GL_EXT_demote_to_helper_invocation is only supported in Vulkan GLSL.");
 		require_extension_internal("GL_EXT_demote_to_helper_invocation");
+		// Helper lane state with demote is volatile by nature.
+		// Do not forward this.
 		emit_op(ops[0], ops[1], "helperInvocationEXT()", false);
 		break;
 
@@ -15722,6 +15804,52 @@ void CompilerGLSL::reset_name_caches()
 	block_ssbo_names.clear();
 	block_names.clear();
 	function_overloads.clear();
+}
+
+void CompilerGLSL::fixup_anonymous_struct_names(std::unordered_set<uint32_t> &visited, const SPIRType &type)
+{
+	if (visited.count(type.self))
+		return;
+	visited.insert(type.self);
+
+	for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
+	{
+		auto &mbr_type = get<SPIRType>(type.member_types[i]);
+
+		if (mbr_type.basetype == SPIRType::Struct)
+		{
+			// If there are multiple aliases, the output might be somewhat unpredictable,
+			// but the only real alternative in that case is to do nothing, which isn't any better.
+			// This check should be fine in practice.
+			if (get_name(mbr_type.self).empty() && !get_member_name(type.self, i).empty())
+			{
+				auto anon_name = join("anon_", get_member_name(type.self, i));
+				ParsedIR::sanitize_underscores(anon_name);
+				set_name(mbr_type.self, anon_name);
+			}
+
+			fixup_anonymous_struct_names(visited, mbr_type);
+		}
+	}
+}
+
+void CompilerGLSL::fixup_anonymous_struct_names()
+{
+	// HLSL codegen can often end up emitting anonymous structs inside blocks, which
+	// breaks GL linking since all names must match ...
+	// Try to emit sensible code, so attempt to find such structs and emit anon_$member.
+
+	// Breaks exponential explosion with weird type trees.
+	std::unordered_set<uint32_t> visited;
+
+	ir.for_each_typed_id<SPIRType>([&](uint32_t, SPIRType &type) {
+		if (type.basetype == SPIRType::Struct &&
+		    (has_decoration(type.self, DecorationBlock) ||
+		     has_decoration(type.self, DecorationBufferBlock)))
+		{
+			fixup_anonymous_struct_names(visited, type);
+		}
+	});
 }
 
 void CompilerGLSL::fixup_type_alias()
