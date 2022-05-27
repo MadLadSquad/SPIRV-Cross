@@ -619,6 +619,11 @@ void CompilerGLSL::find_static_extensions()
 			SPIRV_CROSS_THROW("OVR_multiview2 can only be used with Vertex shaders.");
 		require_extension_internal("GL_OVR_multiview2");
 	}
+
+	// KHR one is likely to get promoted at some point, so if we don't see an explicit SPIR-V extension, assume KHR.
+	for (auto &ext : ir.declared_extensions)
+		if (ext == "SPV_NV_fragment_shader_barycentric")
+			barycentric_is_nv = true;
 }
 
 void CompilerGLSL::ray_tracing_khr_fixup_locations()
@@ -1206,14 +1211,23 @@ string CompilerGLSL::to_interpolation_qualifiers(const Bitset &flags)
 		res += "__explicitInterpAMD ";
 	}
 
-	if (flags.get(DecorationPerVertexNV))
+	if (flags.get(DecorationPerVertexKHR))
 	{
 		if (options.es && options.version < 320)
-			SPIRV_CROSS_THROW("pervertexNV requires ESSL 320.");
+			SPIRV_CROSS_THROW("pervertexEXT requires ESSL 320.");
 		else if (!options.es && options.version < 450)
-			SPIRV_CROSS_THROW("pervertexNV requires GLSL 450.");
-		require_extension_internal("GL_NV_fragment_shader_barycentric");
-		res += "pervertexNV ";
+			SPIRV_CROSS_THROW("pervertexEXT requires GLSL 450.");
+
+		if (barycentric_is_nv)
+		{
+			require_extension_internal("GL_NV_fragment_shader_barycentric");
+			res += "pervertexNV ";
+		}
+		else
+		{
+			require_extension_internal("GL_EXT_fragment_shader_barycentric");
+			res += "pervertexEXT ";
+		}
 	}
 
 	return res;
@@ -6066,6 +6080,16 @@ void CompilerGLSL::emit_binary_func_op(uint32_t result_type, uint32_t result_id,
 void CompilerGLSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1,
                                        const char *op)
 {
+	auto &type = get<SPIRType>(result_type);
+	if (type_is_floating_point(type))
+	{
+		if (!options.vulkan_semantics)
+			SPIRV_CROSS_THROW("Floating point atomics requires Vulkan semantics.");
+		if (options.es)
+			SPIRV_CROSS_THROW("Floating point atomics requires desktop GLSL.");
+		require_extension_internal("GL_EXT_shader_atomic_float");
+	}
+
 	forced_temporaries.insert(result_id);
 	emit_op(result_type, result_id,
 	        join(op, "(", to_non_uniform_aware_expression(op0), ", ",
@@ -6340,7 +6364,11 @@ string CompilerGLSL::legacy_tex_op(const std::string &op, const SPIRType &imgtyp
 	switch (imgtype.image.dim)
 	{
 	case spv::Dim1D:
-		type = (imgtype.image.arrayed && !options.es) ? "1DArray" : "1D";
+		// Force 2D path for ES.
+		if (options.es)
+			type = (imgtype.image.arrayed && !options.es) ? "2DArray" : "2D";
+		else
+			type = (imgtype.image.arrayed && !options.es) ? "1DArray" : "1D";
 		break;
 	case spv::Dim2D:
 		type = (imgtype.image.arrayed && !options.es) ? "2DArray" : "2D";
@@ -7018,8 +7046,8 @@ std::string CompilerGLSL::to_texture_op(const Instruction &i, bool sparse, bool 
 	expr += to_function_args(args, forward);
 	expr += ")";
 
-	// texture(samplerXShadow) returns float. shadowX() returns vec4. Swizzle here.
-	if (is_legacy() && is_depth_image(imgtype, img))
+	// texture(samplerXShadow) returns float. shadowX() returns vec4, but only in desktop GLSL. Swizzle here.
+	if (is_legacy() && !options.es && is_depth_image(imgtype, img))
 		expr += ".r";
 
 	// Sampling from a texture which was deduced to be a depth image, might actually return 1 component here.
@@ -7300,10 +7328,29 @@ string CompilerGLSL::to_function_args(const TextureFunctionArguments &args, bool
 			// Create a composite which merges coord/dref into a single vector.
 			auto type = expression_type(args.coord);
 			type.vecsize = args.coord_components + 1;
+			if (imgtype.image.dim == Dim1D && options.es)
+				type.vecsize++;
 			farg_str += ", ";
 			farg_str += type_to_glsl_constructor(type);
 			farg_str += "(";
-			farg_str += coord_expr;
+
+			if (imgtype.image.dim == Dim1D && options.es)
+			{
+				if (imgtype.image.arrayed)
+				{
+					farg_str += enclose_expression(coord_expr) + ".x";
+					farg_str += ", 0.0, ";
+					farg_str += enclose_expression(coord_expr) + ".y";
+				}
+				else
+				{
+					farg_str += coord_expr;
+					farg_str += ", 0.0";
+				}
+			}
+			else
+				farg_str += coord_expr;
+
 			farg_str += ", ";
 			farg_str += to_expression(args.dref);
 			farg_str += ")";
@@ -7311,6 +7358,33 @@ string CompilerGLSL::to_function_args(const TextureFunctionArguments &args, bool
 	}
 	else
 	{
+		if (imgtype.image.dim == Dim1D && options.es)
+		{
+			// Have to fake a second coordinate.
+			if (type_is_floating_point(coord_type))
+			{
+				// Cannot mix proj and array.
+				if (imgtype.image.arrayed || args.base.is_proj)
+				{
+					coord_expr = join("vec3(", enclose_expression(coord_expr), ".x, 0.0, ",
+					                  enclose_expression(coord_expr), ".y)");
+				}
+				else
+					coord_expr = join("vec2(", coord_expr, ", 0.0)");
+			}
+			else
+			{
+				if (imgtype.image.arrayed)
+				{
+					coord_expr = join("ivec3(", enclose_expression(coord_expr),
+									  ".x, 0, ",
+									  enclose_expression(coord_expr), ".y)");
+				}
+				else
+					coord_expr = join("ivec2(", coord_expr, ", 0)");
+			}
+		}
+
 		farg_str += ", ";
 		farg_str += coord_expr;
 	}
@@ -8698,24 +8772,42 @@ string CompilerGLSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
 	case BuiltInIncomingRayFlagsKHR:
 		return ray_tracing_is_khr ? "gl_IncomingRayFlagsEXT" : "gl_IncomingRayFlagsNV";
 
-	case BuiltInBaryCoordNV:
+	case BuiltInBaryCoordKHR:
 	{
 		if (options.es && options.version < 320)
-			SPIRV_CROSS_THROW("gl_BaryCoordNV requires ESSL 320.");
+			SPIRV_CROSS_THROW("gl_BaryCoordEXT requires ESSL 320.");
 		else if (!options.es && options.version < 450)
-			SPIRV_CROSS_THROW("gl_BaryCoordNV requires GLSL 450.");
-		require_extension_internal("GL_NV_fragment_shader_barycentric");
-		return "gl_BaryCoordNV";
+			SPIRV_CROSS_THROW("gl_BaryCoordEXT requires GLSL 450.");
+
+		if (barycentric_is_nv)
+		{
+			require_extension_internal("GL_NV_fragment_shader_barycentric");
+			return "gl_BaryCoordNV";
+		}
+		else
+		{
+			require_extension_internal("GL_EXT_fragment_shader_barycentric");
+			return "gl_BaryCoordEXT";
+		}
 	}
 
 	case BuiltInBaryCoordNoPerspNV:
 	{
 		if (options.es && options.version < 320)
-			SPIRV_CROSS_THROW("gl_BaryCoordNoPerspNV requires ESSL 320.");
+			SPIRV_CROSS_THROW("gl_BaryCoordNoPerspEXT requires ESSL 320.");
 		else if (!options.es && options.version < 450)
-			SPIRV_CROSS_THROW("gl_BaryCoordNoPerspNV requires GLSL 450.");
-		require_extension_internal("GL_NV_fragment_shader_barycentric");
-		return "gl_BaryCoordNoPerspNV";
+			SPIRV_CROSS_THROW("gl_BaryCoordNoPerspEXT requires GLSL 450.");
+
+		if (barycentric_is_nv)
+		{
+			require_extension_internal("GL_NV_fragment_shader_barycentric");
+			return "gl_BaryCoordNoPerspNV";
+		}
+		else
+		{
+			require_extension_internal("GL_EXT_fragment_shader_barycentric");
+			return "gl_BaryCoordNoPerspEXT";
+		}
 	}
 
 	case BuiltInFragStencilRefEXT:
@@ -12132,6 +12224,7 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 	}
 
 	case OpAtomicIAdd:
+	case OpAtomicFAddEXT:
 	{
 		const char *op = check_atomic_image(ops[2]) ? "imageAtomicAdd" : "atomicAdd";
 		emit_atomic_func_op(ops[0], ops[1], ops[2], ops[5], op);
@@ -12484,6 +12577,10 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 			target_coord_type.basetype = SPIRType::Int;
 			coord_expr = bitcast_expression(target_coord_type, expression_type(ops[3]).basetype, coord_expr);
 
+			// ES needs to emulate 1D images as 2D.
+			if (type.image.dim == Dim1D && options.es)
+				coord_expr = join("ivec2(", coord_expr, ", 0)");
+
 			// Plain image load/store.
 			if (sparse)
 			{
@@ -12595,6 +12692,10 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		auto target_coord_type = expression_type(ops[1]);
 		target_coord_type.basetype = SPIRType::Int;
 		coord_expr = bitcast_expression(target_coord_type, expression_type(ops[1]).basetype, coord_expr);
+
+		// ES needs to emulate 1D images as 2D.
+		if (type.image.dim == Dim1D && options.es)
+			coord_expr = join("ivec2(", coord_expr, ", 0)");
 
 		if (type.image.ms)
 		{
@@ -13956,7 +14057,8 @@ string CompilerGLSL::image_type_glsl(const SPIRType &type, uint32_t id)
 	switch (type.image.dim)
 	{
 	case Dim1D:
-		res += "1D";
+		// ES doesn't support 1D. Fake it with 2D.
+		res += options.es ? "2D" : "1D";
 		break;
 	case Dim2D:
 		res += "2D";
