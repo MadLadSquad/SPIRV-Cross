@@ -10741,8 +10741,14 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		if (expr_type.vecsize > type.vecsize)
 			expr = enclose_expression(expr + vector_swizzle(type.vecsize, 0));
 
+		if (forward && ptr_expression)
+			ptr_expression->need_transpose = old_need_transpose;
+
 		// We might need to cast in order to load from a builtin.
 		cast_from_variable_load(ptr, expr, type);
+
+		if (forward && ptr_expression)
+			ptr_expression->need_transpose = false;
 
 		// We might be trying to load a gl_Position[N], where we should be
 		// doing float4[](gl_in[i].gl_Position, ...) instead.
@@ -11261,8 +11267,13 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		// forcing temporaries is not going to help.
 		// This is similar for Constant and Undef inputs.
 		// The only safe thing to RMW is SPIRExpression.
+		// If the expression has already been used (i.e. used in a continue block), we have to keep using
+		// that loop variable, since we won't be able to override the expression after the fact.
+		// If the composite is hoisted, we might never be able to properly invalidate any usage
+		// of that composite in a subsequent loop iteration.
 		if (invalid_expressions.count(composite) ||
 		    block_composite_insert_overwrite.count(composite) ||
+		    hoisted_temporaries.count(id) || hoisted_temporaries.count(composite) ||
 		    maybe_get<SPIRExpression>(composite) == nullptr)
 		{
 			can_modify_in_place = false;
