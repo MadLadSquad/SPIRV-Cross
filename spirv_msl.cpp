@@ -856,7 +856,7 @@ void CompilerMSL::build_implicit_builtins()
 		swizzle_buffer_id = var_id;
 	}
 
-	if (!buffers_requiring_array_length.empty())
+	if (needs_buffer_size_buffer())
 	{
 		uint32_t var_id = build_constant_uint_array_pointer();
 		set_name(var_id, "spvBufferSizeConstants");
@@ -4740,6 +4740,11 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 
 		auto &physical_type = get<SPIRType>(physical_type_id);
 
+		string cast_addr_space = "thread";
+		auto *p_var_lhs = maybe_get_backing_variable(lhs_expression);
+		if (p_var_lhs)
+			cast_addr_space = get_type_address_space(get<SPIRType>(p_var_lhs->basetype), lhs_expression);
+
 		if (is_matrix(type))
 		{
 			const char *packed_pfx = lhs_packed_type ? "packed_" : "";
@@ -4767,7 +4772,7 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 				write_type.columns = 1;
 
 				if (physical_type.columns != type.columns)
-					cast_expr = join("(device ", packed_pfx, type_to_glsl(write_type), "&)");
+					cast_expr = join("(", cast_addr_space, " ", packed_pfx, type_to_glsl(write_type), "&)");
 
 				if (rhs_transpose)
 				{
@@ -4809,7 +4814,7 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 				write_type.columns = 1;
 
 				if (physical_type.vecsize != type.vecsize)
-					cast_expr = join("(device ", packed_pfx, type_to_glsl(write_type), "&)");
+					cast_expr = join("(", cast_addr_space, " ", packed_pfx, type_to_glsl(write_type), "&)");
 
 				if (rhs_transpose)
 				{
@@ -4864,7 +4869,7 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 				auto column_index = lhs_expr.find_last_of('[');
 				if (column_index != string::npos)
 				{
-					statement("((device ", type_to_glsl(write_type), "*)&",
+					statement("((", cast_addr_space, " ", type_to_glsl(write_type), "*)&",
 					          lhs_expr.insert(column_index, join('[', c, ']', ")")), " = ",
 					          to_extract_component_expression(rhs_expression, c), ";");
 				}
@@ -4887,7 +4892,7 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 
 			// Unpack the expression so we can store to it with a float or float2.
 			// It's still an l-value, so it's fine. Most other unpacking of expressions turn them into r-values instead.
-			lhs = join("(device ", type_to_glsl(type), "&)", enclose_expression(lhs));
+			lhs = join("(", cast_addr_space, " ", type_to_glsl(type), "&)", enclose_expression(lhs));
 			if (!optimize_read_modify_write(expression_type(rhs_expression), lhs, rhs))
 				statement(lhs, " = ", rhs, ";");
 		}
@@ -10016,7 +10021,7 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
 			decl += join(", constant uint", arg_is_array ? "* " : "& ", to_swizzle_expression(arg.id));
 		}
 
-		if (buffers_requiring_array_length.count(name_id))
+		if (buffer_requires_array_length(name_id))
 		{
 			bool arg_is_array = !arg_type.array.empty();
 			decl += join(", constant uint", arg_is_array ? "* " : "& ", to_buffer_size_expression(name_id));
@@ -11053,7 +11058,7 @@ string CompilerMSL::to_func_call_arg(const SPIRFunction::Parameter &arg, uint32_
 		else if (msl_options.swizzle_texture_samples && has_sampled_images && is_sampled_image_type(type))
 			arg_str += ", " + to_swizzle_expression(var_id ? var_id : id);
 
-		if (buffers_requiring_array_length.count(var_id))
+		if (buffer_requires_array_length(var_id))
 			arg_str += ", " + to_buffer_size_expression(var_id ? var_id : id);
 
 		if (is_dynamic_img_sampler)
@@ -12762,7 +12767,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 		else if ((var.storage == StorageClassStorageBuffer || (var.storage == StorageClassUniform && ssbo)) &&
 		         !is_hidden_variable(var))
 		{
-			if (buffers_requiring_array_length.count(var.self))
+			if (buffer_requires_array_length(var.self))
 			{
 				entry_func.fixup_hooks_in.push_back([this, &type, &var, var_id]() {
 					bool is_array_type = !type.array.empty();
@@ -16705,7 +16710,7 @@ void CompilerMSL::analyze_argument_buffers()
 			// Check if this descriptor set needs a swizzle buffer.
 			if (needs_swizzle_buffer_def && is_sampled_image_type(type))
 				set_needs_swizzle_buffer[desc_set] = true;
-			else if (buffers_requiring_array_length.count(var_id) != 0)
+			else if (buffer_requires_array_length(var_id))
 			{
 				set_needs_buffer_sizes[desc_set] = true;
 				needs_buffer_sizes = true;
