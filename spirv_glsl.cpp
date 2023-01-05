@@ -4965,9 +4965,9 @@ SmallVector<ConstantID> CompilerGLSL::get_composite_constant_ids(ConstantID cons
 		if (is_array(type) || type.basetype == SPIRType::Struct)
 			return constant->subconstants;
 		if (is_matrix(type))
-			return constant->m.id;
+			return SmallVector<ConstantID>(constant->m.id);
 		if (is_vector(type))
-			return constant->m.c[0].id;
+			return SmallVector<ConstantID>(constant->m.c[0].id);
 		SPIRV_CROSS_THROW("Unexpected scalar constant!");
 	}
 	if (!const_composite_insert_ids.count(const_id))
@@ -10092,7 +10092,7 @@ bool CompilerGLSL::should_dereference(uint32_t id)
 			// same type. Can't check type.self, because for some reason that's
 			// usually the base type with pointers stripped off. This check is
 			// complex enough that I've hoisted it out of the while condition.
-			if (src_type.pointer != type.pointer || src_type.pointer_depth != type.pointer ||
+			if (src_type.pointer != type.pointer || src_type.pointer_depth != type.pointer_depth ||
 			    src_type.parent_type != type.parent_type)
 				break;
 			if ((var = maybe_get<SPIRVariable>(expr->loaded_from)))
