@@ -9472,7 +9472,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		add_spv_func_and_recompile(SPVFuncImplRayQueryIntersectionParams);
 
 		statement(to_expression(ops[0]), ".reset(", "ray(", to_expression(ops[4]), ", ", to_expression(ops[6]), ", ",
-		          to_expression(ops[5]), ", ", to_expression(ops[7]), "), ", to_expression(ops[1]),
+		          to_expression(ops[5]), ", ", to_expression(ops[7]), "), ", to_expression(ops[1]), ", ", to_expression(ops[3]),
 		          ", spvMakeIntersectionParams(", to_expression(ops[2]), "));");
 		break;
 	}
@@ -9863,7 +9863,7 @@ uint32_t CompilerMSL::get_physical_tess_level_array_size(spv::BuiltIn builtin) c
 bool CompilerMSL::maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs)
 {
 	// We only care about assignments of an entire array
-	auto &type = expression_type(id_rhs);
+	auto &type = expression_type(id_lhs);
 	if (!type_is_top_level_array(get_pointee_type(type)))
 		return false;
 
