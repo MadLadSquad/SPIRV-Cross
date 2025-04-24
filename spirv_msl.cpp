@@ -274,7 +274,7 @@ void CompilerMSL::build_implicit_builtins()
 	     active_input_builtins.get(BuiltInInstanceIndex) || active_input_builtins.get(BuiltInBaseInstance));
 	bool need_local_invocation_index =
 		(msl_options.emulate_subgroups && active_input_builtins.get(BuiltInSubgroupId)) || is_mesh_shader() ||
-		needs_workgroup_zero_init;
+		needs_workgroup_zero_init || needs_local_invocation_index;
 	bool need_workgroup_size = msl_options.emulate_subgroups && active_input_builtins.get(BuiltInNumSubgroups);
 	bool force_frag_depth_passthrough =
 	    get_execution_model() == ExecutionModelFragment && !uses_explicit_early_fragment_test() && need_subpass_input &&
@@ -1802,6 +1802,8 @@ void CompilerMSL::preprocess_op_codes()
 		capture_output_to_buffer = true;
 	}
 
+	if (preproc.needs_local_invocation_index)
+		needs_local_invocation_index = true;
 	if (preproc.needs_subgroup_invocation_id)
 		needs_subgroup_invocation_id = true;
 	if (preproc.needs_subgroup_size)
@@ -2152,6 +2154,15 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 				default:
 					break;
 				}
+				break;
+			}
+
+			case OpGroupNonUniformRotateKHR:
+			{
+				// Add the correct invocation ID for calculating clustered rotate case.
+				if (i.length > 5)
+					added_arg_ids.insert(static_cast<Scope>(evaluate_constant_u32(ops[2])) == ScopeSubgroup
+						? builtin_subgroup_invocation_id_id : builtin_local_invocation_index_id);
 				break;
 			}
 
@@ -6914,6 +6925,36 @@ void CompilerMSL::emit_custom_functions()
 			statement("");
 			break;
 
+		case SPVFuncImplSubgroupRotate:
+			statement("template<typename T>");
+			statement("inline T spvSubgroupRotate(T value, ushort delta)");
+			begin_scope();
+			if (msl_options.use_quadgroup_operation())
+				statement("return quad_shuffle_rotate_down(value, delta);");
+			else
+				statement("return simd_shuffle_rotate_down(value, delta);");
+			end_scope();
+			statement("");
+			statement("template<>");
+			statement("inline bool spvSubgroupRotate(bool value, ushort delta)");
+			begin_scope();
+			if (msl_options.use_quadgroup_operation())
+				statement("return !!quad_shuffle_rotate_down((ushort)value, delta);");
+			else
+				statement("return !!simd_shuffle_rotate_down((ushort)value, delta);");
+			end_scope();
+			statement("");
+			statement("template<uint N>");
+			statement("inline vec<bool, N> spvSubgroupRotate(vec<bool, N> value, ushort delta)");
+			begin_scope();
+			if (msl_options.use_quadgroup_operation())
+				statement("return (vec<bool, N>)quad_shuffle_rotate_down((vec<ushort, N>)value, delta);");
+			else
+				statement("return (vec<bool, N>)simd_shuffle_rotate_down((vec<ushort, N>)value, delta);");
+			end_scope();
+			statement("");
+			break;
+
 		case SPVFuncImplQuadBroadcast:
 			statement("template<typename T>");
 			statement("inline T spvQuadBroadcast(T value, uint lane)");
@@ -7867,6 +7908,26 @@ void CompilerMSL::emit_custom_functions()
 			end_scope();
 			end_scope();
 			statement("");
+			break;
+
+		case SPVFuncImplAssume:
+			statement_no_indent("#if defined(__has_builtin)");
+			statement_no_indent("#if !defined(SPV_ASSUME) && __has_builtin(__builtin_assume)");
+			statement_no_indent("#define SPV_ASSUME(x) __builtin_assume(x);");
+			statement_no_indent("#endif");
+			statement_no_indent("#if !defined(SPV_EXPECT) && __has_builtin(__builtin_expect)");
+			statement_no_indent("#define SPV_EXPECT(x, y) __builtin_expect(x, y);");
+			statement_no_indent("#endif");
+			statement_no_indent("#endif");
+
+			statement_no_indent("#ifndef SPV_ASSUME");
+			statement_no_indent("#define SPV_ASSUME(x)");
+			statement_no_indent("#endif");
+
+			statement_no_indent("#ifndef SPV_EXPECT");
+			statement_no_indent("#define SPV_EXPECT(x, y) x");
+			statement_no_indent("#endif");
+
 			break;
 
 		default:
@@ -10219,6 +10280,27 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		flush_variable_declaration(builtin_mesh_primitive_indices_id);
 		add_spv_func_and_recompile(SPVFuncImplSetMeshOutputsEXT);
 		statement("spvSetMeshOutputsEXT(gl_LocalInvocationIndex, spvMeshSizes, ", to_unpacked_expression(ops[0]), ", ", to_unpacked_expression(ops[1]), ");");
+		break;
+	}
+
+	case OpAssumeTrueKHR:
+	{
+		auto condition = ops[0];
+		statement(join("SPV_ASSUME(", to_unpacked_expression(condition), ")"));
+		break;
+	}
+
+	case OpExpectKHR:
+	{
+		auto result_type = ops[0];
+		auto ret = ops[1];
+		auto value = ops[2];
+		auto exp_value = ops[3];
+
+		auto exp = join("SPV_EXPECT(", to_unpacked_expression(value), ", ", to_unpacked_expression(exp_value), ")");
+		emit_op(result_type, ret, exp, should_forward(value), should_forward(exp_value));
+		inherit_expression_dependencies(ret, value);
+		inherit_expression_dependencies(ret, exp_value);
 		break;
 	}
 
@@ -16571,6 +16653,10 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
 			if (!msl_options.supports_msl_version(2, 2))
 				SPIRV_CROSS_THROW("Ballot ops on iOS requires Metal 2.2 and up.");
 			break;
+		case OpGroupNonUniformRotateKHR:
+			if (!msl_options.supports_msl_version(2, 2))
+				SPIRV_CROSS_THROW("Rotate on iOS requires Metal 2.2 and up.");
+			break;
 		case OpGroupNonUniformBroadcast:
 		case OpGroupNonUniformShuffle:
 		case OpGroupNonUniformShuffleXor:
@@ -16699,6 +16785,23 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
 	case OpGroupNonUniformShuffleDown:
 		emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupShuffleDown");
 		break;
+
+	case OpGroupNonUniformRotateKHR:
+	{
+		if (i.length > 5)
+		{
+			// MSL does not have a cluster size parameter, so calculate the invocation ID manually and using a shuffle.
+			auto delta_expr = enclose_expression(to_unpacked_expression(ops[op_idx + 1]));
+			auto cluster_size_minus_one = evaluate_constant_u32(ops[op_idx + 2]) - 1;
+			auto local_id_expr = to_unpacked_expression(scope == ScopeSubgroup
+				? builtin_subgroup_invocation_id_id : builtin_local_invocation_index_id);
+			auto shuffle_idx = join("((", local_id_expr, " + ", delta_expr, ")", " & ", std::to_string(cluster_size_minus_one),
+				") + (", local_id_expr, " & ", std::to_string(~cluster_size_minus_one), ")");
+			emit_op(result_type, id, join("spvSubgroupShuffle(", to_unpacked_expression(ops[op_idx]), ", ", shuffle_idx, ")"), false);
+		} else
+			emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupRotate");
+		break;
+	}
 
 	case OpGroupNonUniformAll:
 	case OpSubgroupAllKHR:
@@ -17781,7 +17884,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 	// suppress_missing_prototypes to suppress compiler warnings of missing function prototypes.
 
 	// Mark if the input requires the implementation of an SPIR-V function that does not exist in Metal.
-	SPVFuncImpl spv_func = get_spv_func_impl(opcode, args);
+	SPVFuncImpl spv_func = get_spv_func_impl(opcode, args, length);
 	if (spv_func != SPVFuncImplNone)
 	{
 		compiler.spv_function_implementations.insert(spv_func);
@@ -17888,6 +17991,17 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 			needs_subgroup_invocation_id = true;
 		break;
 
+	case OpGroupNonUniformRotateKHR:
+		// Add the correct invocation ID for calculating clustered rotate case.
+		if (length > 5)
+		{
+			if (static_cast<Scope>(compiler.evaluate_constant_u32(args[2])) == ScopeSubgroup)
+				needs_subgroup_invocation_id = true;
+			else
+				needs_local_invocation_index = true;
+		}
+		break;
+
 	case OpArrayLength:
 	{
 		auto *var = compiler.maybe_get_backing_variable(args[2]);
@@ -17990,7 +18104,7 @@ void CompilerMSL::OpCodePreprocessor::check_resource_write(uint32_t var_id)
 }
 
 // Returns an enumeration of a SPIR-V function that needs to be output for certain Op codes.
-CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op opcode, const uint32_t *args)
+CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op opcode, const uint32_t *args, uint32_t length)
 {
 	switch (opcode)
 	{
@@ -18172,6 +18286,12 @@ CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op o
 	case OpGroupNonUniformShuffleDown:
 		return SPVFuncImplSubgroupShuffleDown;
 
+	case OpGroupNonUniformRotateKHR:
+		// Clustered rotate is performed using shuffle.
+		if (length > 5)
+			return SPVFuncImplSubgroupShuffle;
+		return SPVFuncImplSubgroupRotate;
+
 	case OpGroupNonUniformQuadBroadcast:
 		return SPVFuncImplQuadBroadcast;
 
@@ -18189,6 +18309,10 @@ CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op o
 	case OpSMulExtended:
 	case OpUMulExtended:
 		return SPVFuncImplMulExtended;
+
+	case OpAssumeTrueKHR:
+	case OpExpectKHR:
+		return SPVFuncImplAssume;
 
 	default:
 		break;

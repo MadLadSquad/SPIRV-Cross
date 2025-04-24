@@ -6111,7 +6111,9 @@ string CompilerGLSL::convert_half_to_string(const SPIRConstant &c, uint32_t col,
 string CompilerGLSL::convert_float_to_string(const SPIRConstant &c, uint32_t col, uint32_t row)
 {
 	string res;
-	float float_value = c.scalar_f32(col, row);
+
+	bool is_bfloat16 = get<SPIRType>(c.constant_type).basetype == SPIRType::BFloat16;
+	float float_value = is_bfloat16 ? c.scalar_bf16(col, row) : c.scalar_f32(col, row);
 
 	if (std::isnan(float_value) || std::isinf(float_value))
 	{
@@ -6174,6 +6176,9 @@ string CompilerGLSL::convert_float_to_string(const SPIRConstant &c, uint32_t col
 		if (backend.float_literal_suffix)
 			res += "f";
 	}
+
+	if (is_bfloat16)
+		res = join("bfloat16_t(", res, ")");
 
 	return res;
 }
@@ -6353,6 +6358,7 @@ string CompilerGLSL::constant_expression_vector(const SPIRConstant &c, uint32_t 
 		}
 		break;
 
+	case SPIRType::BFloat16:
 	case SPIRType::Float:
 		if (splat || swizzle_splat)
 		{
@@ -9381,6 +9387,10 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 		require_extension_internal("GL_KHR_shader_subgroup_shuffle_relative");
 		break;
 
+	case OpGroupNonUniformRotateKHR:
+		require_extension_internal("GL_KHR_shader_subgroup_rotate");
+		break;
+
 	case OpGroupNonUniformAll:
 	case OpGroupNonUniformAny:
 	case OpGroupNonUniformAllEqual:
@@ -9525,6 +9535,13 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 
 	case OpGroupNonUniformShuffleDown:
 		emit_binary_func_op(result_type, id, ops[3], ops[4], "subgroupShuffleDown");
+		break;
+
+	case OpGroupNonUniformRotateKHR:
+		if (i.length > 5)
+			emit_trinary_func_op(result_type, id, ops[3], ops[4], ops[5], "subgroupClusteredRotate");
+		else
+			emit_binary_func_op(result_type, id, ops[3], ops[4], "subgroupRotate");
 		break;
 
 	case OpGroupNonUniformAll:
@@ -9729,6 +9746,14 @@ string CompilerGLSL::bitcast_glsl_op(const SPIRType &out_type, const SPIRType &i
 		return "packUint4x16";
 	else if (out_type.basetype == SPIRType::UShort && in_type.basetype == SPIRType::UInt64 && in_type.vecsize == 1)
 		return "unpackUint4x16";
+	else if (out_type.basetype == SPIRType::BFloat16 && in_type.basetype == SPIRType::UShort)
+		return "uintBitsToBFloat16EXT";
+	else if (out_type.basetype == SPIRType::BFloat16 && in_type.basetype == SPIRType::Short)
+		return "intBitsToBFloat16EXT";
+	else if (out_type.basetype == SPIRType::UShort && in_type.basetype == SPIRType::BFloat16)
+		return "bfloat16BitsToUintEXT";
+	else if (out_type.basetype == SPIRType::Short && in_type.basetype == SPIRType::BFloat16)
+		return "bfloat16BitsToIntEXT";
 
 	return "";
 }
@@ -15059,6 +15084,7 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 	case OpGroupNonUniformLogicalXor:
 	case OpGroupNonUniformQuadSwap:
 	case OpGroupNonUniformQuadBroadcast:
+	case OpGroupNonUniformRotateKHR:
 		emit_subgroup_op(instruction);
 		break;
 
@@ -16436,6 +16462,11 @@ string CompilerGLSL::type_to_glsl(const SPIRType &type, uint32_t id)
 			return "atomic_uint";
 		case SPIRType::Half:
 			return "float16_t";
+		case SPIRType::BFloat16:
+			if (!options.vulkan_semantics)
+				SPIRV_CROSS_THROW("bfloat16 requires Vulkan semantics.");
+			require_extension_internal("GL_EXT_bfloat16");
+			return "bfloat16_t";
 		case SPIRType::Float:
 			return "float";
 		case SPIRType::Double:
@@ -16468,6 +16499,11 @@ string CompilerGLSL::type_to_glsl(const SPIRType &type, uint32_t id)
 			return join("uvec", type.vecsize);
 		case SPIRType::Half:
 			return join("f16vec", type.vecsize);
+		case SPIRType::BFloat16:
+			if (!options.vulkan_semantics)
+				SPIRV_CROSS_THROW("bfloat16 requires Vulkan semantics.");
+			require_extension_internal("GL_EXT_bfloat16");
+			return join("bf16vec", type.vecsize);
 		case SPIRType::Float:
 			return join("vec", type.vecsize);
 		case SPIRType::Double:

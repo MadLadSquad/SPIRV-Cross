@@ -814,6 +814,7 @@ protected:
 		SPVFuncImplSubgroupShuffleXor,
 		SPVFuncImplSubgroupShuffleUp,
 		SPVFuncImplSubgroupShuffleDown,
+		SPVFuncImplSubgroupRotate,
 		SPVFuncImplQuadBroadcast,
 		SPVFuncImplQuadSwap,
 		SPVFuncImplReflectScalar,
@@ -849,6 +850,7 @@ protected:
 		SPVFuncImplTextureCast,
 		SPVFuncImplMulExtended,
 		SPVFuncImplSetMeshOutputsEXT,
+		SPVFuncImplAssume,
 	};
 
 	// If the underlying resource has been used for comparison then duplicate loads of that resource must be too
@@ -1222,6 +1224,7 @@ protected:
 	bool needs_swizzle_buffer_def = false;
 	bool used_swizzle_buffer = false;
 	bool added_builtin_tess_level = false;
+	bool needs_local_invocation_index = false;
 	bool needs_subgroup_invocation_id = false;
 	bool needs_subgroup_size = false;
 	bool needs_sample_id = false;
@@ -1322,7 +1325,7 @@ protected:
 		}
 
 		bool handle(spv::Op opcode, const uint32_t *args, uint32_t length) override;
-		CompilerMSL::SPVFuncImpl get_spv_func_impl(spv::Op opcode, const uint32_t *args);
+		CompilerMSL::SPVFuncImpl get_spv_func_impl(spv::Op opcode, const uint32_t *args, uint32_t length);
 		void check_resource_write(uint32_t var_id);
 
 		CompilerMSL &compiler;
@@ -1333,6 +1336,7 @@ protected:
 		bool uses_image_write = false;
 		bool uses_buffer_write = false;
 		bool uses_discard = false;
+		bool needs_local_invocation_index = false;
 		bool needs_subgroup_invocation_id = false;
 		bool needs_subgroup_size = false;
 		bool needs_sample_id = false;
